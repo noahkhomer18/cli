@@ -14,6 +14,8 @@ backward compatible.
 
 ### Fixed
 
+- **`vg scan` uses a newer `go.mod` `toolchain` as the Go runtime.** The `go` line stays the runtime when it is the only version, or when its major.minor is the same or newer. `go 1.21` with `toolchain go1.23.4` is reported as `1.23`, and runtime lag and end-of-life use `1.23`. Versions are compared as numbers, so `1.9` is older than `1.21`. `toolchain default`, a malformed value, and a `toolchain` line inside a block stay on the `go` version. A `toolchain` line with no `go` line is the runtime (#648).
+
 - **`vg scan` reports a .NET runtime inherited from `Directory.Build.props`.** A project that sets neither `TargetFramework` nor `TargetFrameworks` takes them from the nearest `Directory.Build.props` between that project and the scanned directory. A value in the project file wins. A value that contains `$(`, such as `$(DefaultTfm)`, is not reported as a runtime (#627).
 
 - **`vg scan` reads OpenTofu `.tofu` files for provider and module drift.** `required_providers`, `required_version`, and registry `module` blocks in a `.tofu` file are scored, including a tree that has no `.tf` file. When `x.tf` and `x.tofu` are in the same directory, only `x.tofu` is read. A `.tf` file with no `.tofu` sibling is unchanged. The file list used when there is no file index also includes `terraform.tf` and the `.tofu` names of the usual root files (#622).

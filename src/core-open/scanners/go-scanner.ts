@@ -118,6 +118,11 @@ interface ReplaceDirective {
 /**
  * Parse go.mod to extract dependencies, tool package paths, and Go version.
  *
+ * The `go` directive is the minimum language version. A top-level
+ * `toolchain goX.Y[.Z]` is returned beside it as `toolchainVersion`
+ * (major.minor only). `toolchain default`, a value that is not `goX.Y`,
+ * and a `toolchain` line inside a block are ignored.
+ *
  * `replace` may appear before or after the `require` it rewrites, so directives
  * are collected and applied after the whole file is read. A version on the left
  * (`a v1.2.0 => …`) applies only to that version and wins over a versionless
@@ -125,19 +130,26 @@ interface ReplaceDirective {
  *
  * Example:
  *   module github.com/example/project
- *   go 1.24
+ *   go 1.21
+ *   toolchain go1.23.4
  *   tool golang.org/x/tools/cmd/stringer
  *   require (
  *     github.com/gin-gonic/gin v1.9.1
  *     github.com/stretchr/testify v1.8.4 // indirect
  *   )
  */
-function parseGoMod(content: string): { goVersion?: string; deps: GoDependency[]; tools: string[] } {
+function parseGoMod(content: string): {
+  goVersion?: string;
+  toolchainVersion?: string;
+  deps: GoDependency[];
+  tools: string[];
+} {
   const deps: GoDependency[] = [];
   const replaces: ReplaceDirective[] = [];
   const tools: string[] = [];
   let goVersion: string | undefined;
-  let block: 'require' | 'replace' | 'tool' | null = null;
+  let toolchainVersion: string | undefined;
+  let block: 'require' | 'replace' | 'tool' | 'skip' | null = null;
 
   for (const line of content.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -148,6 +160,14 @@ function parseGoMod(content: string): { goVersion?: string; deps: GoDependency[]
     if (trimmed.startsWith('go ')) {
       const match = trimmed.match(/^go\s+(\d+\.\d+)/);
       if (match) goVersion = match[1];
+      continue;
+    }
+
+    // Top-level only. `toolchain default` and `toolchain go1` do not match.
+    // A line inside require/replace/tool/exclude/retract is not a directive.
+    if (block === null && trimmed.startsWith('toolchain ')) {
+      const match = trimmed.match(/^toolchain\s+go(\d+)\.(\d+)/);
+      if (match) toolchainVersion = `${match[1]}.${match[2]}`;
       continue;
     }
 
@@ -174,6 +194,10 @@ function parseGoMod(content: string): { goVersion?: string; deps: GoDependency[]
       }
       if (/^replace\s*\(/.test(trimmed) && !/^replace\s*\(.*\)\s*$/.test(trimmed)) {
         block = 'replace';
+        continue;
+      }
+      if (/^(?:exclude|retract)\s*\(/.test(trimmed) && !/^(?:exclude|retract)\s*\(.*\)\s*$/.test(trimmed)) {
+        block = 'skip';
         continue;
       }
       if (/^require\s*\(.*\)\s*$/.test(trimmed)) {
@@ -210,14 +234,36 @@ function parseGoMod(content: string): { goVersion?: string; deps: GoDependency[]
     } else if (block === 'tool') {
       const toolPath = toolPackagePath(trimmed);
       if (toolPath) tools.push(toolPath);
-    } else {
+    } else if (block === 'replace') {
       const directive = parseReplaceLine(trimmed);
       if (directive) replaces.push(directive);
     }
   }
 
   applyReplacements(deps, replaces);
-  return { goVersion, deps, tools };
+  return { goVersion, toolchainVersion, deps, tools };
+}
+
+/** major.minor as numbers, so `1.9` is older than `1.21`. */
+function goMinorParts(version: string): { major: number; minor: number } | undefined {
+  const match = /^(\d+)\.(\d+)/.exec(version);
+  if (!match) return undefined;
+  return { major: parseInt(match[1]!, 10), minor: parseInt(match[2]!, 10) };
+}
+
+/**
+ * Version the module is built with. A toolchain major.minor newer than the
+ * `go` line wins. With no `go` line, the toolchain version is the runtime.
+ */
+function effectiveGoVersion(goVersion?: string, toolchainVersion?: string): string | undefined {
+  if (!toolchainVersion) return goVersion;
+  if (!goVersion) return toolchainVersion;
+  const go = goMinorParts(goVersion);
+  const toolchain = goMinorParts(toolchainVersion);
+  if (!go || !toolchain) return goVersion;
+  const newer = toolchain.major > go.major
+    || (toolchain.major === go.major && toolchain.minor > go.minor);
+  return newer ? toolchainVersion : goVersion;
 }
 
 /** Package path from a `tool` line, ignoring a trailing comment. */
@@ -484,7 +530,8 @@ async function scanOneGoProject(
   const projectName = path.basename(dir === rootDir ? rootDir : dir);
   
   const content = cache ? await cache.readTextFile(manifestFile) : await readTextFile(manifestFile);
-  const { goVersion, deps: allDeps, tools } = parseGoMod(content);
+  const { goVersion, toolchainVersion, deps: allDeps, tools } = parseGoMod(content);
+  const runtimeVersion = effectiveGoVersion(goVersion, toolchainVersion);
 
   // Indirect requires stay out of the scan unless they provide a `tool`
   // package. Those modules are development dependencies. A module that is
@@ -505,8 +552,8 @@ async function scanOneGoProject(
   let runtimeEol: boolean | null | undefined;
   let runtimeEolDate: string | undefined;
 
-  if (goVersion) {
-    const verMatch = goVersion.match(/(\d+)\.(\d+)/);
+  if (runtimeVersion) {
+    const verMatch = runtimeVersion.match(/(\d+)\.(\d+)/);
     if (verMatch) {
       const reqMajor = parseInt(verMatch[1]!, 10);
       const reqMinor = parseInt(verMatch[2]!, 10);
@@ -520,8 +567,8 @@ async function scanOneGoProject(
         runtimeLatest = `${LATEST_GO_MINOR.major}.${LATEST_GO_MINOR.minor}`;
       }
     }
-    runtimeEol = runtimeEolStatus(catalog, 'go', goVersion);
-    const cycle = extractCycle('go', goVersion);
+    runtimeEol = runtimeEolStatus(catalog, 'go', runtimeVersion);
+    const cycle = extractCycle('go', runtimeVersion);
     if (cycle) runtimeEolDate = eolDate(catalog, 'go', cycle);
   }
 
@@ -614,7 +661,7 @@ async function scanOneGoProject(
     type: 'go',
     path: relDir,
     name: projectName,
-    runtime: goVersion,
+    runtime: runtimeVersion,
     runtimeLatest,
     runtimeMajorsBehind,
     runtimeEol,
