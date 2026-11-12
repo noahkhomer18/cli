@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>2.4.0</version>
+  </parent>
+  <!-- groupId and version are inherited from the parent element. -->
+  <artifactId>app</artifactId>
+  <properties>
+    <sibling.version>${project.version}</sibling.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>core</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>${project.artifactId}-tests</artifactId>
+      <version>${sibling.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>unknown-version</artifactId>
+      <version>${does.not.exist}</version>
+    </dependency>
+    <dependency>
+      <groupId>${missing.groupId}</groupId>
+      <artifactId>unknown-group</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>${missing.artifactId}</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>

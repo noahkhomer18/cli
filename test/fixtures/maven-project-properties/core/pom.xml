@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>2.4.0</version>
+  </parent>
+  <artifactId>core</artifactId>
+  <version>${revision}</version>
+  <properties>
+    <revision>3.1.0</revision>
+    <!-- Explicit properties win over the built-in of the same name. -->
+    <project.version>9.9.9</project.version>
+    <lib.version>1.2.3</lib.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>${pom.groupId}</groupId>
+      <artifactId>from-pom-alias</artifactId>
+      <version>${pom.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>${groupId}</groupId>
+      <artifactId>from-version-alias</artifactId>
+      <version>${version}</version>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>explicit-property</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>${project.parent.groupId}</groupId>
+      <artifactId>parent-coordinates</artifactId>
+      <version>${project.parent.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>plain-lib</artifactId>
+      <version>${lib.version}</version>
+    </dependency>
+  </dependencies>
+</project>

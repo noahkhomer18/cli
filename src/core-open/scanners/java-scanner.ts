@@ -196,11 +196,29 @@ function parsePom(xml: string, filePath: string): PomData {
     }
   }
 
+  // Parent coordinates are in this POM. A child that omits groupId or version
+  // inherits the parent element; the parent file itself is not read.
+  let parent: PomData['parent'];
+  if (project.parent?.groupId && project.parent?.artifactId) {
+    parent = {
+      groupId: String(project.parent.groupId),
+      artifactId: String(project.parent.artifactId),
+      version: String(project.parent.version ?? ''),
+    };
+  }
+
+  const groupId = project.groupId ? String(project.groupId) : parent?.groupId;
+  const artifactId = String(project.artifactId ?? path.basename(path.dirname(filePath)));
+  const version = project.version ? String(project.version) : parent?.version;
+  // Built-ins (`${project.version}`, `${project.groupId}`, `pom.*`, …) are
+  // filled in here. Explicit `<properties>` already in `properties` win.
+  const coordinates = withProjectCoordinates(properties, { groupId, artifactId, version, parent });
+
   // Extract dependencies. Top-level blocks are stored first. The scan
   // keeps the first versioned coordinate, so a later profile entry does not
   // replace a top-level row.
   const dependencies: PomDependency[] = [];
-  appendPomDependencies(dependencies, project.dependencies, properties, {
+  appendPomDependencies(dependencies, project.dependencies, coordinates, {
     requireVersion: false,
     profileOnly: false,
   });
@@ -212,7 +230,7 @@ function parsePom(xml: string, filePath: string): PomData {
   // optional on the pin use the same section rules, so a test or optional
   // pin is not recorded as a production dependency. `<scope>import</scope>`
   // (a BOM) is not test, so that pin stays `dependencies`.
-  appendPomDependencies(dependencies, project.dependencyManagement?.dependencies, properties, {
+  appendPomDependencies(dependencies, project.dependencyManagement?.dependencies, coordinates, {
     requireVersion: true,
     profileOnly: false,
   });
@@ -227,11 +245,11 @@ function parsePom(xml: string, filePath: string): PomData {
     dependencyManagement?: { dependencies?: unknown };
   }>(project.profiles?.profile)) {
     if (!profile || typeof profile !== 'object') continue;
-    appendPomDependencies(dependencies, profile.dependencies, properties, {
+    appendPomDependencies(dependencies, profile.dependencies, coordinates, {
       requireVersion: false,
       profileOnly: true,
     });
-    appendPomDependencies(dependencies, profile.dependencyManagement?.dependencies, properties, {
+    appendPomDependencies(dependencies, profile.dependencyManagement?.dependencies, coordinates, {
       requireVersion: true,
       profileOnly: true,
     });
@@ -243,20 +261,10 @@ function parsePom(xml: string, filePath: string): PomData {
     : [];
   const modules = rawModules.map(String);
 
-  // Parent
-  let parent: PomData['parent'];
-  if (project.parent?.groupId && project.parent?.artifactId) {
-    parent = {
-      groupId: String(project.parent.groupId),
-      artifactId: String(project.parent.artifactId),
-      version: String(project.parent.version ?? ''),
-    };
-  }
-
   return {
-    groupId: project.groupId ? String(project.groupId) : parent?.groupId,
-    artifactId: String(project.artifactId ?? path.basename(path.dirname(filePath))),
-    version: project.version ? String(project.version) : parent?.version,
+    groupId,
+    artifactId,
+    version,
     packaging: project.packaging ? String(project.packaging) : undefined,
     javaVersion,
     dependencies,
@@ -301,8 +309,73 @@ function markProfileOnlyDependency(dep: PomDependency): PomDependency {
   return { ...dep, optional: true };
 }
 
+/** Stop `${a}` → `${b}` → `${a}` from expanding forever. Real POMs nest only a few levels. */
+const MAX_MAVEN_PROPERTY_EXPANSIONS = 8;
+
+function assignIfAbsent(target: Record<string, string>, key: string, value: string | undefined): void {
+  if (!value || target[key] !== undefined) return;
+  target[key] = value;
+}
+
+/**
+ * Maven project coordinates as properties. Explicit `<properties>` are copied
+ * first and are never overwritten. `project.version` / `project.groupId` use
+ * the parent coordinate when this POM omits them. `pom.*` and the older bare
+ * `version`, `groupId`, and `artifactId` names alias the same values.
+ * Coordinate text is expanded against `<properties>` first, so
+ * `<version>${revision}</version>` becomes the property's value.
+ */
+function withProjectCoordinates(
+  properties: Record<string, string>,
+  project: {
+    groupId?: string;
+    artifactId?: string;
+    version?: string;
+    parent?: { groupId: string; artifactId: string; version: string };
+  },
+): Record<string, string> {
+  const merged: Record<string, string> = { ...properties };
+  const version = resolveProperty(project.version ?? '', properties);
+  const groupId = resolveProperty(project.groupId ?? '', properties);
+  const artifactId = resolveProperty(project.artifactId ?? '', properties);
+  const parentVersion = resolveProperty(project.parent?.version ?? '', properties);
+  const parentGroupId = resolveProperty(project.parent?.groupId ?? '', properties);
+  const parentArtifactId = resolveProperty(project.parent?.artifactId ?? '', properties);
+
+  assignIfAbsent(merged, 'project.version', version);
+  assignIfAbsent(merged, 'pom.version', version);
+  assignIfAbsent(merged, 'version', version);
+  assignIfAbsent(merged, 'project.groupId', groupId);
+  assignIfAbsent(merged, 'pom.groupId', groupId);
+  assignIfAbsent(merged, 'groupId', groupId);
+  assignIfAbsent(merged, 'project.artifactId', artifactId);
+  assignIfAbsent(merged, 'pom.artifactId', artifactId);
+  assignIfAbsent(merged, 'artifactId', artifactId);
+  assignIfAbsent(merged, 'project.parent.version', parentVersion);
+  assignIfAbsent(merged, 'pom.parent.version', parentVersion);
+  assignIfAbsent(merged, 'project.parent.groupId', parentGroupId);
+  assignIfAbsent(merged, 'pom.parent.groupId', parentGroupId);
+  assignIfAbsent(merged, 'project.parent.artifactId', parentArtifactId);
+  assignIfAbsent(merged, 'pom.parent.artifactId', parentArtifactId);
+  return merged;
+}
+
 function resolveProperty(value: string, properties: Record<string, string>): string {
-  return value.replace(/\$\{([^}]+)\}/g, (_, key: string) => properties[key] ?? `\${${key}}`);
+  let current = value;
+  for (let pass = 0; pass < MAX_MAVEN_PROPERTY_EXPANSIONS; pass++) {
+    if (!current.includes('${')) return current;
+    const next = current.replace(/\$\{([^}]+)\}/g, (_, key: string) => {
+      const replacement = properties[key];
+      return replacement === undefined ? `\${${key}}` : replacement;
+    });
+    if (next === current) return current;
+    current = next;
+  }
+  return current;
+}
+
+function mavenRefUnresolved(value: string): boolean {
+  return value.includes('${');
 }
 
 function readPomDependency(d: Record<string, unknown>, properties: Record<string, string>): PomDependency {
@@ -594,7 +667,17 @@ async function scanOneJavaProject(
 
       for (const dep of pom.dependencies) {
         const key = `${dep.groupId}:${dep.artifactId}`;
-        if (!allDeps.has(key) && dep.version && !dep.version.includes('${')) {
+        // Leftover `${...}` in any coordinate part is not a resolvable row.
+        // Group and artifact are checked as well as version: a concrete
+        // version with `${project.groupId}` still unfilled would otherwise
+        // be stored under that literal key.
+        if (
+          !allDeps.has(key) &&
+          dep.version &&
+          !mavenRefUnresolved(dep.version) &&
+          !mavenRefUnresolved(dep.groupId) &&
+          !mavenRefUnresolved(dep.artifactId)
+        ) {
           allDeps.set(key, dep);
         }
       }
