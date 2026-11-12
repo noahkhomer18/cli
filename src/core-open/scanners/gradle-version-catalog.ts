@@ -256,8 +256,10 @@ function knownAccessor(dotted: string, keys: ReadonlySet<string>): string | null
  * `libs…` uses in a Gradle build file, in source order.
  *
  * `configNames` is the configuration alternation the Java scanner already
- * recognizes (`implementation|api|…`). `platform(libs…)` is recorded as
- * configuration `platform`, matching a quoted platform declaration.
+ * recognizes (`implementation|api|…`). A word boundary is required before that
+ * alternation so `implementation` does not match inside a longer identifier.
+ * `platform(libs…)` is recorded as configuration `platform`, matching a quoted
+ * platform declaration.
  */
 export function gradleCatalogUses(
   content: string,
@@ -275,7 +277,7 @@ export function gradleCatalogUses(
   };
 
   const aliasRe = new RegExp(
-    `(?:${configNames})\\s*(?:\\(\\s*)?libs\\.(bundles\\.)?([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)*)`,
+    `\\b(?:${configNames})\\s*(?:\\(\\s*)?libs\\.(bundles\\.)?([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)*)`,
     'g',
   );
   let match: RegExpExecArray | null;

@@ -340,14 +340,22 @@ function mavenManifestSection(dep: { scope?: string; optional?: boolean }): DepS
 }
 
 /**
- * Gradle test configurations are dev rows. `implementation`, `api`,
- * `compileOnly`, `runtimeOnly`, `annotationProcessor`, `kapt`, and `platform`
- * stay production. A coordinate declared both ways keeps the production row.
+ * Gradle test configurations are dev rows. Names that start with `androidTest`,
+ * `testFixtures`, or `test`, plus `kaptTest`, `kaptAndroidTest`, and `kspTest`,
+ * are dev. `implementation`, `api`, `compileOnly`, `runtimeOnly`,
+ * `debugImplementation`, `ksp`, `kapt`, `developmentOnly`, `annotationProcessor`,
+ * and `platform` stay production. A coordinate declared both ways keeps the
+ * production row.
  */
-const GRADLE_TEST_CONFIGURATIONS = new Set(['testImplementation', 'testRuntimeOnly', 'testCompileOnly']);
-
 function isGradleTestConfiguration(configuration: string): boolean {
-  return GRADLE_TEST_CONFIGURATIONS.has(configuration);
+  if (
+    configuration.startsWith('androidTest') ||
+    configuration.startsWith('testFixtures') ||
+    configuration.startsWith('test')
+  ) {
+    return true;
+  }
+  return configuration === 'kaptTest' || configuration === 'kaptAndroidTest' || configuration === 'kspTest';
 }
 
 function javaManifestSection(dep: { scope?: string; optional?: boolean; configuration?: string }): DepSection {
@@ -398,7 +406,28 @@ function considerGradleDep(deps: GradleDependency[], dep: GradleDependency): voi
   }
 }
 
-const GRADLE_CONFIG_NAMES = 'implementation|api|compileOnly|runtimeOnly|testImplementation|testRuntimeOnly|testCompileOnly|annotationProcessor|kapt';
+/**
+ * Configuration names matched in Groovy and Kotlin DSL, and in `libs…` aliases.
+ *
+ * Call sites put a word boundary before this alternation so `implementation`
+ * does not match inside a longer identifier. CamelCase build-type, flavour,
+ * and Android names (`androidTestImplementation`, `debugImplementation`,
+ * `releaseApi`, `testFixturesApi`, `compileOnlyApi`, …) share one suffix.
+ * `ksp`, `kapt`, `kaptTest`, `kaptAndroidTest`, `kspTest`, `developmentOnly`,
+ * and `annotationProcessor` are explicit. Groups stay non-capturing: the
+ * catalog matcher numbers its own captures after this alternation.
+ */
+const GRADLE_CONFIG_NAMES = [
+  '[a-z][A-Za-z]*(?:Implementation|Api|CompileOnly|RuntimeOnly)',
+  'implementation',
+  'api',
+  'compileOnly',
+  'runtimeOnly',
+  'annotationProcessor',
+  'developmentOnly',
+  'kapt(?:AndroidTest|Test)?',
+  'ksp(?:Test)?',
+].join('|');
 
 interface GradleDepEvent {
   index: number;
@@ -441,14 +470,14 @@ export function parseGradleBuild(
 
   // Parse dependencies: implementation 'group:artifact:version'
   // The optional parenthesis also matches Kotlin DSL `implementation("g:a:v")`.
-  const depRegex = new RegExp(`(?:${GRADLE_CONFIG_NAMES})\\s*(?:\\(?\\s*)?['"]([^'"]+)['"]`, 'g');
+  const depRegex = new RegExp(`\\b(?:${GRADLE_CONFIG_NAMES})\\s*(?:\\(?\\s*)?['"]([^'"]+)['"]`, 'g');
   let match: RegExpExecArray | null;
   while ((match = depRegex.exec(content)) !== null) {
     pushGradleCoord(events, match.index, match[1]!, bareGradleConfiguration(match[0]!));
   }
 
   // Parse Kotlin DSL: implementation("group:artifact:version")
-  const kotlinDepRegex = new RegExp(`(?:${GRADLE_CONFIG_NAMES})\\s*\\(\\s*"([^"]+)"\\s*\\)`, 'g');
+  const kotlinDepRegex = new RegExp(`\\b(?:${GRADLE_CONFIG_NAMES})\\s*\\(\\s*"([^"]+)"\\s*\\)`, 'g');
   while ((match = kotlinDepRegex.exec(content)) !== null) {
     pushGradleCoord(events, match.index, match[1]!, bareGradleConfiguration(match[0]!));
   }
