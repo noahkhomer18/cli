@@ -10,7 +10,7 @@ import { rethrowLockfileParseError } from '../utils/lockfile-parse.js';
 import { loadNpmLockIndex, type NpmLockIndex, type LockfileIo } from './npm-lockfile.js';
 import { Semaphore } from '../utils/semaphore.js';
 import { withTimeout } from '../utils/timeout.js';
-import { NpmCache, isSemverSpec } from './npm-cache.js';
+import { NpmCache, resolveNpmDependencySpec } from './npm-cache.js';
 import { classifyNpmVersionLag } from './npm-latest.js';
 import { buildDependencyLicense, normalizeLicenseSourcePath } from '../licenses/dependency-license.js';
 import { ageDaysBetween, daysToLibyears, aggregateLibyears } from '../scoring/libyear.js';
@@ -217,7 +217,8 @@ export async function scanNodeProjects(
       for (const deps of depSections) {
         if (!deps) continue;
         for (const [pkg, spec] of Object.entries(deps)) {
-          if (isSemverSpec(spec)) allNpmPkgs.add(pkg);
+          const resolved = resolveNpmDependencySpec(pkg, spec);
+          if (resolved) allNpmPkgs.add(resolved.package);
         }
       }
     } catch {
@@ -341,32 +342,50 @@ async function scanOnePackageJson(
   const frameworks: DetectedFramework[] = [];
   const buckets = { current: 0, oneBehind: 0, twoPlusBehind: 0, unknown: 0 };
 
-  // Collect all dep promises first for parallel resolution
-  const depEntries: { pkg: string; section: DepSection; spec: string }[] = [];
+  // Collect all dep promises first for parallel resolution.
+  // An `npm:` alias is fetched and scored as its target; the manifest key stays
+  // the row's package name.
+  const depEntries: {
+    pkg: string;
+    section: DepSection;
+    spec: string;
+    registryPackage: string;
+    range: string;
+    alias: boolean;
+  }[] = [];
   for (const s of sections) {
     if (!s.deps) continue;
     for (const [pkg, spec] of Object.entries(s.deps)) {
-      if (!isSemverSpec(spec)) continue;
-      depEntries.push({ pkg, section: s.name, spec });
+      const resolvedSpec = resolveNpmDependencySpec(pkg, spec);
+      if (!resolvedSpec) continue;
+      depEntries.push({
+        pkg,
+        section: s.name,
+        spec,
+        registryPackage: resolvedSpec.package,
+        range: resolvedSpec.range,
+        alias: resolvedSpec.alias,
+      });
     }
   }
 
   // Warm cache in batch to reduce npm process/network overhead.
-  await npmCache.prefetch(depEntries.map((entry) => entry.pkg));
+  await npmCache.prefetch(depEntries.map((entry) => entry.registryPackage));
 
   // Resolve metadata from cache (misses transparently fetch as needed).
   const metaPromises = depEntries.map(async (entry) => {
-    const meta = await npmCache.get(entry.pkg);
+    const meta = await npmCache.get(entry.registryPackage);
     return { ...entry, meta };
   });
 
   const resolved = await Promise.all(metaPromises);
 
-  for (const { pkg, section, spec, meta } of resolved) {
+  for (const { pkg, section, spec, meta, registryPackage, range, alias } of resolved) {
     // Latest stable release that still satisfies the declared range — the best
-    // version an install could bring in without editing the manifest.
+    // version an install could bring in without editing the manifest. For an
+    // alias, `range` is the target's range (`*` when the alias omitted one).
     const latestSatisfying = meta.stableVersions.length > 0
-      ? semver.maxSatisfying(meta.stableVersions, spec) ?? null
+      ? semver.maxSatisfying(meta.stableVersions, range) ?? null
       : null;
     // Prefer the lockfile's EXACT installed version (authoritative + works
     // offline) — but only while it still satisfies the declared range. Once the
@@ -374,13 +393,14 @@ async function scanOnePackageJson(
     // installed), the lock entry describes the OLD dependency; keeping it would
     // freeze the reported drift until the next install. An unparseable range
     // keeps the lock (satisfaction is undecidable, and the lock is still the
-    // installed truth).
+    // installed truth). Aliased installs are keyed by the manifest name
+    // (`node_modules/<alias>`), so the lookup stays on `pkg`, not the target.
     const lockedVersion = lockIndex?.resolve(pkg, spec) ?? null;
-    const range = semver.validRange(spec);
+    const validRange = semver.validRange(range);
     const lockUsable =
       !!lockedVersion &&
       !!semver.valid(lockedVersion) &&
-      (!range || semver.satisfies(lockedVersion, range, { includePrerelease: true }));
+      (!validRange || semver.satisfies(lockedVersion, validRange, { includePrerelease: true }));
     const resolvedVersion = lockUsable ? lockedVersion : latestSatisfying;
 
     const lag = classifyNpmVersionLag(resolvedVersion, meta.latestStableOverall);
@@ -410,6 +430,7 @@ async function scanOnePackageJson(
 
     dependencies.push({
       package: pkg,
+      ...(alias ? { registryPackage } : {}),
       section,
       currentSpec: spec,
       resolvedVersion,
@@ -423,10 +444,11 @@ async function scanOnePackageJson(
       ...(abandoned ? { abandoned: true } : {}),
     });
 
-    // Detect known frameworks
-    if (pkg in KNOWN_FRAMEWORKS) {
+    // Detect known frameworks. An alias is recognised by its target
+    // (`react-17` → `npm:react@^17`), which is the package that was scored.
+    if (registryPackage in KNOWN_FRAMEWORKS) {
       frameworks.push({
-        name: KNOWN_FRAMEWORKS[pkg]!,
+        name: KNOWN_FRAMEWORKS[registryPackage]!,
         currentVersion: resolvedVersion,
         latestVersion: latestStable,
         majorsBehind,

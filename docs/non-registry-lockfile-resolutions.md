@@ -96,11 +96,12 @@ A second package that exists only under `node_modules/` in the lockfile, with `r
 
 ## Manifest specs that are not registry ranges
 
-`vg scan` scores a Node dependency when the `package.json` spec is a semver range (including `*` and `latest`). These specs are handled on their own. The lockfile URL does not fill in a range for them.
+`vg scan` scores a Node dependency when the `package.json` spec is a semver range (including `*` and `latest`) or an `npm:` alias of one. The specs below are handled on their own. The lockfile URL does not fill in a range for them.
 
 | Spec in `package.json` | Scan row | Advisory target | Code-map `external` node |
 | --- | --- | --- | --- |
 | Semver range (`^1.3.0`) | `currentSpec` is the range. `resolvedVersion` is the lockfile version when that version is valid semver and still satisfies the range. | `npm` + name + `resolvedVersion`. | The name. |
+| npm alias (`npm:string-width@^4.2.0`, `npm:@scope/pkg@^1`, or `npm:chalk` with no range) | Row kept. `package` is the manifest key. `currentSpec` is the original text. `registryPackage` is the target. Drift and `latestSatisfying` use the target's metadata and the target range (`*` when the alias has no range). `resolvedVersion` is the lockfile version stored under the alias name when that version satisfies the target range. | `npm` + alias name + `resolvedVersion`. | The alias name. |
 | `workspace:*` | Row kept. `resolvedVersion` is `null`. `drift` is `unknown`. | Omitted. A null version is not a target. | The name, when the spec is under `dependencies`, `peerDependencies`, or `optionalDependencies`. |
 | `file:`, `link:`, `git+`, `github:`, or any spec that contains `://` | No row. | Not a direct target. | The name, from those same three sections. The spec string is not stored on the node. |
 

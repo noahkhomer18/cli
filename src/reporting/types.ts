@@ -85,6 +85,12 @@ export interface DependencyRow {
    * the same chart. Absent when the manifest entry has no alias.
    */
   alias?: string;
+  /**
+   * Registry package an npm alias installs (`"alias": "npm:target@^1"`).
+   * `package` stays the manifest key and `currentSpec` stays the original
+   * text. Absent for an ordinary spec.
+   */
+  registryPackage?: string;
   section: DepSection;
   currentSpec: string;
   resolvedVersion: string | null;

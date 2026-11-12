@@ -278,7 +278,59 @@ export async function checkRegistryAccess(cwd: string): Promise<boolean> {
   }
 }
 
-export function isSemverSpec(spec: string): boolean {
+/**
+ * npm alias protocol (`"alias": "npm:target@^1.2.0"`).
+ * `package` is the registry name; `range` is the target range.
+ * A missing range is `*`, so it matches the way an unconstrained spec does.
+ */
+export interface NpmAliasSpec {
+  package: string;
+  range: string;
+}
+
+/** Registry package and range a manifest dependency should be scored against. */
+export interface ResolvedNpmDependencySpec {
+  /** Registry package to fetch. The manifest key for an ordinary spec; the alias target otherwise. */
+  package: string;
+  /** Range passed to semver. The original spec text for an ordinary dependency. */
+  range: string;
+  /** True when `spec` is an `npm:` alias. */
+  alias: boolean;
+}
+
+// Scoped or unscoped npm package name. Rejects ranges, URLs, and whitespace so
+// `npm:^1.2.0` (a protocol with no target) stays a non-alias spec.
+const NPM_PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/i;
+
+/**
+ * Parse `npm:<name>`, `npm:<name>@<range>`, and scoped `npm:@scope/pkg@^1`.
+ * The range separator is the last `@` after an optional scope. Returns null
+ * when the text is not an alias of a package name.
+ */
+export function parseNpmAliasSpec(spec: string): NpmAliasSpec | null {
+  const s = spec.trim();
+  if (!s.startsWith('npm:')) return null;
+  const body = s.slice('npm:'.length);
+  if (!body) return null;
+
+  const scoped = body.startsWith('@');
+  let name = body;
+  let range: string | undefined;
+  const at = body.lastIndexOf('@');
+  if (at >= (scoped ? 1 : 0)) {
+    const slash = scoped ? body.indexOf('/') : -1;
+    if (!scoped || at > slash) {
+      name = body.slice(0, at);
+      range = body.slice(at + 1).trim();
+    }
+  }
+  if (!NPM_PACKAGE_NAME.test(name)) return null;
+  if (range === undefined) return { package: name, range: '*' };
+  if (!range) return null;
+  return { package: name, range };
+}
+
+function isPlainSemverRange(spec: string): boolean {
   const s = spec.trim();
   if (!s) return false;
   if (s.startsWith('workspace:')) return false;
@@ -289,4 +341,23 @@ export function isSemverSpec(spec: string): boolean {
   if (s.startsWith('github:')) return false;
   if (s === '*' || s.toLowerCase() === 'latest') return true;
   return semver.validRange(s) !== null;
+}
+
+/**
+ * Registry package and range for one `package.json` dependency, or null when
+ * the spec is not a registry range the scanner can score.
+ */
+export function resolveNpmDependencySpec(manifestName: string, spec: string): ResolvedNpmDependencySpec | null {
+  const alias = parseNpmAliasSpec(spec);
+  if (alias) {
+    if (!isPlainSemverRange(alias.range)) return null;
+    return { package: alias.package, range: alias.range, alias: true };
+  }
+  if (!isPlainSemverRange(spec)) return null;
+  return { package: manifestName, range: spec, alias: false };
+}
+
+export function isSemverSpec(spec: string): boolean {
+  // The manifest name is unused for the boolean; an alias carries its own target.
+  return resolveNpmDependencySpec('pkg', spec) !== null;
 }
