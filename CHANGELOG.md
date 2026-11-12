@@ -115,6 +115,8 @@ backward compatible.
 
 ### Added
 
+- **`vg scan` links Elixir umbrella apps.** `{:core, in_umbrella: true}` in an app under an umbrella records a project reference to that app. The app directory is `<umbrella>/<apps_path>/<name>`, and `apps_path` defaults to `apps`. A `path:` dependency records a project reference to that directory. A reference is kept only when the target is an Elixir project in the same scan. `git:`, `github:`, `path:`, and `in_umbrella:` tuples stay out of the Hex dependency rows, and drift is unchanged (#667).
+
 - **`vg scan --summary-out` includes the drift budget verdict.** The JSON
   summary adds `driftBudget` (`source`, `mode`, `withinBudget`, `blocking`,
   `rules`), or `null` when no budget is set. A budget from `--drift-budget`

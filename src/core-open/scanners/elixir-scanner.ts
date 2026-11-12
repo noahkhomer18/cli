@@ -3,7 +3,7 @@
 // and re-run the vendor script. Apache-2.0.
 import { fetchHexVersionsBulk } from './hex-cache.js';
 import { gt, minVersion, validRange } from 'semver';
-import type { ProjectScan, DependencyRow, DepSection, DetectedFramework } from '../types.js';
+import type { ProjectScan, DependencyRow, DepSection, DetectedFramework, ProjectReference } from '../types.js';
 import { readTextFile, pathExists, FileCache } from '../utils/fs.js';
 import type { PackageVersionManifest } from '../package-version-manifest.js';
 import * as path from 'node:path';
@@ -15,6 +15,29 @@ interface ElixirDependency {
   isDev: boolean;
   /** True when `optional: true`. Dev wins over this when the row is built. */
   optional: boolean;
+}
+
+/**
+ * A Mix dependency that points at another project in this repository.
+ * `path:` keeps the path written in mix.exs. `in_umbrella: true` keeps the
+ * app name; the directory is resolved later from the umbrella `apps_path`.
+ */
+type ElixirLink =
+  | { kind: 'path'; name: string; path: string }
+  | { kind: 'umbrella'; name: string };
+
+interface ParsedDepTuple {
+  hex: ElixirDependency | null;
+  links: ElixirLink[];
+}
+
+interface ElixirProjectParts {
+  project: ProjectScan;
+  links: ElixirLink[];
+  /** Directory of umbrella apps. `"apps"` when mix.exs does not set `apps_path`. */
+  appsPath: string;
+  /** True when this mix.exs sets `apps_path`. */
+  appsPathDeclared: boolean;
 }
 
 /** Mix source options that are not Hex packages. */
@@ -342,14 +365,16 @@ function findMatchingBrace(content: string, openIndex: number): number {
 /**
  * Read one `{:name, "version", keyword: value, ...}` tuple.
  * `git:`, `github:`, `path:`, and `in_umbrella:` tuples are not Hex deps.
+ * `path:` and `in_umbrella: true` are kept as links to other projects.
  * The first double-quoted string is the version requirement.
  */
-function parseDepTuple(name: string, inner: string): ElixirDependency | null {
+function parseDepTuple(name: string, inner: string): ParsedDepTuple {
   let i = 0;
   let version: string | null = null;
   let skip = false;
   let isDev = false;
   let optional = false;
+  const links: ElixirLink[] = [];
 
   while (i < inner.length) {
     const sigilEnd = skipSigil(inner, i);
@@ -384,7 +409,22 @@ function parseDepTuple(name: string, inner: string): ElixirDependency | null {
       const after = skipWsComments(inner, i);
       if (inner[after] === ':') {
         const valueAt = after + 1;
-        if (NON_HEX_SOURCE_KEYS.has(ident)) {
+        if (ident === 'path') {
+          skip = true;
+          const valuePos = skipWsComments(inner, valueAt);
+          if (inner[valuePos] === '"') {
+            const str = readString(inner, valuePos);
+            if (str.value !== '') links.push({ kind: 'path', name, path: str.value });
+            i = str.end;
+          } else {
+            i = skipValue(inner, valueAt);
+          }
+        } else if (ident === 'in_umbrella') {
+          skip = true;
+          const flag = parseOptionalFlag(inner, valueAt);
+          if (flag.optional) links.push({ kind: 'umbrella', name });
+          i = flag.end;
+        } else if (NON_HEX_SOURCE_KEYS.has(ident)) {
           skip = true;
           i = skipValue(inner, valueAt);
         } else if (ident === 'only') {
@@ -415,12 +455,13 @@ function parseDepTuple(name: string, inner: string): ElixirDependency | null {
     i++;
   }
 
-  if (skip || version === null || version === '') return null;
-  return { name, version, isDev, optional };
+  const hex = skip || version === null || version === '' ? null : { name, version, isDev, optional };
+  return { hex, links };
 }
 
-function parseDepTuples(content: string): ElixirDependency[] {
+function parseDepTuples(content: string): { deps: ElixirDependency[]; links: ElixirLink[] } {
   const deps: ElixirDependency[] = [];
+  const links: ElixirLink[] = [];
   let i = 0;
   while (i < content.length) {
     const sigilEnd = skipSigil(content, i);
@@ -446,8 +487,9 @@ function parseDepTuples(content: string): ElixirDependency[] {
       if (named) {
         const end = findMatchingBrace(content, i);
         if (end > i) {
-          const dep = parseDepTuple(named.name, content.slice(named.innerStart, end));
-          if (dep) deps.push(dep);
+          const parsed = parseDepTuple(named.name, content.slice(named.innerStart, end));
+          if (parsed.hex) deps.push(parsed.hex);
+          links.push(...parsed.links);
           i = end + 1;
           continue;
         }
@@ -455,17 +497,68 @@ function parseDepTuples(content: string): ElixirDependency[] {
     }
     i++;
   }
-  return deps;
+  return { deps, links };
+}
+
+/**
+ * `apps_path` from a mix.exs keyword list. The first key wins. A value that
+ * is not a double-quoted string still marks the project as an umbrella and
+ * uses the default directory `apps`.
+ */
+function parseAppsPath(content: string): { declared: boolean; appsPath: string } {
+  let i = 0;
+  while (i < content.length) {
+    const sigilEnd = skipSigil(content, i);
+    if (sigilEnd !== null) {
+      i = sigilEnd;
+      continue;
+    }
+    const c = content[i];
+    if (c === '#') {
+      while (i < content.length && content[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '"') {
+      i = endOfString(content, i);
+      continue;
+    }
+    if (c === '\'') {
+      i = skipCharlist(content, i);
+      continue;
+    }
+    if (isIdentChar(c) && (i === 0 || !isIdentChar(content[i - 1]))) {
+      const start = i;
+      while (isIdentChar(content[i])) i++;
+      const ident = content.slice(start, i);
+      const after = skipWsComments(content, i);
+      if (ident === 'apps_path' && content[after] === ':') {
+        const valuePos = skipWsComments(content, after + 1);
+        if (content[valuePos] === '"') {
+          const value = readString(content, valuePos).value.trim();
+          return { declared: true, appsPath: value === '' ? 'apps' : value };
+        }
+        return { declared: true, appsPath: 'apps' };
+      }
+      i = after;
+      continue;
+    }
+    i++;
+  }
+  return { declared: false, appsPath: 'apps' };
 }
 
 /**
  * Parse mix.exs to extract dependencies.
  * Tuples may carry a keyword list of any length, including across lines.
- * `{:dep, git: "..."}`, `path:`, and `in_umbrella:` are skipped.
+ * `{:dep, git: "..."}`, `path:`, and `in_umbrella:` are not Hex deps.
+ * `path:` and `in_umbrella: true` are returned as project links.
  */
 async function parseMixExs(filePath: string, cache?: FileCache): Promise<{
   elixirVersion?: string;
   deps: ElixirDependency[];
+  links: ElixirLink[];
+  appsPath: string;
+  appsPathDeclared: boolean;
 }> {
   const content = cache
     ? await cache.readTextFile(filePath)
@@ -473,7 +566,9 @@ async function parseMixExs(filePath: string, cache?: FileCache): Promise<{
 
   const elixirMatch = content.match(/elixir:\s*"([^"]+)"/);
   const elixirVersion = elixirMatch?.[1];
-  return { elixirVersion, deps: parseDepTuples(content) };
+  const { deps, links } = parseDepTuples(content);
+  const { declared, appsPath } = parseAppsPath(content);
+  return { elixirVersion, deps, links, appsPath, appsPathDeclared: declared };
 }
 
 /**
@@ -541,14 +636,15 @@ function calculateDrift(
 }
 
 /**
- * Scan a directory for Elixir projects.
+ * Scan a directory for one Elixir project.
+ * Project links are kept on the result for `scanElixirProjects` to resolve.
  */
-export async function scanElixir(
+async function readElixirProject(
   projectPath: string,
   cache?: FileCache,
   manifest?: PackageVersionManifest,
   offline = false,
-): Promise<ProjectScan | null> {
+): Promise<ElixirProjectParts | null> {
   const mixExsPath = `${projectPath}/mix.exs`;
   
   // Check if mix.exs exists
@@ -560,7 +656,7 @@ export async function scanElixir(
     return null;
   }
 
-  const { elixirVersion, deps } = await parseMixExs(mixExsPath, cache);
+  const { elixirVersion, deps, links, appsPath, appsPathDeclared } = await parseMixExs(mixExsPath, cache);
 
   // Read mix.lock for exact versions
   const mixLockPath = `${projectPath}/mix.lock`;
@@ -637,14 +733,77 @@ export async function scanElixir(
   }
 
   return {
-    type: 'elixir',
-    path: path.relative(projectPath.includes('/') ? projectPath.split('/').slice(0, -1).join('/') : '.', projectPath) || '.',
-    name: path.basename(projectPath),
-    runtime: elixirVersion,
-    frameworks,
-    dependencies,
-    dependencyAgeBuckets: buckets,
+    project: {
+      type: 'elixir',
+      path: path.relative(projectPath.includes('/') ? projectPath.split('/').slice(0, -1).join('/') : '.', projectPath) || '.',
+      name: path.basename(projectPath),
+      runtime: elixirVersion,
+      frameworks,
+      dependencies,
+      dependencyAgeBuckets: buckets,
+    },
+    links,
+    appsPath,
+    appsPathDeclared,
   };
+}
+
+/**
+ * Scan a directory for Elixir projects.
+ */
+export async function scanElixir(
+  projectPath: string,
+  cache?: FileCache,
+  manifest?: PackageVersionManifest,
+  offline = false,
+): Promise<ProjectScan | null> {
+  const parts = await readElixirProject(projectPath, cache, manifest, offline);
+  return parts?.project ?? null;
+}
+
+function umbrellaAppDir(
+  projectDir: string,
+  rootDir: string,
+  appName: string,
+  self: ElixirProjectParts,
+  byAbsDir: Map<string, ElixirProjectParts>,
+): string {
+  if (self.appsPathDeclared) return path.resolve(projectDir, self.appsPath, appName);
+  const root = path.resolve(rootDir);
+  let current = path.dirname(path.resolve(projectDir));
+  while (true) {
+    const ancestor = byAbsDir.get(current);
+    if (ancestor) return path.resolve(current, ancestor.appsPath, appName);
+    if (current === root || path.dirname(current) === current) break;
+    current = path.dirname(current);
+  }
+  // No umbrella mix.exs inside the scan. Apps in the default layout are siblings.
+  return path.resolve(projectDir, '..', appName);
+}
+
+function linkReferences(
+  projectDir: string,
+  rootDir: string,
+  selfPath: string,
+  self: ElixirProjectParts,
+  byAbsDir: Map<string, ElixirProjectParts>,
+): ProjectReference[] {
+  const refs: ProjectReference[] = [];
+  const seen = new Set<string>();
+  for (const link of self.links) {
+    const abs = link.kind === 'path'
+      ? path.resolve(projectDir, link.path)
+      : umbrellaAppDir(projectDir, rootDir, link.name, self, byAbsDir);
+    const target = byAbsDir.get(path.resolve(abs));
+    if (!target || target.project.path === selfPath || seen.has(target.project.path)) continue;
+    seen.add(target.project.path);
+    refs.push({
+      path: target.project.path,
+      name: target.project.name,
+      refType: 'workspace',
+    });
+  }
+  return refs;
 }
 
 /**
@@ -677,18 +836,18 @@ export async function scanElixirProjects(
     projectDirs.get(dir)!.push(f);
   }
 
-  const results: ProjectScan[] = [];
+  const loaded: Array<{ dir: string; parts: ElixirProjectParts }> = [];
 
   for (const [dir] of projectDirs) {
     try {
-      const scan = await scanElixir(dir, cache, manifest, offline);
-      if (scan) {
+      const parts = await readElixirProject(dir, cache, manifest, offline);
+      if (parts) {
         // Report the repo-relative directory, not the basename: the project
         // dedupe in run-scan keys on path, so a basename here makes the same
         // mix.exs appear twice (once via this scanner, once via the polyglot
         // scanner's repo-relative entry).
-        scan.path = path.relative(rootDir, dir) || '.';
-        results.push(scan);
+        parts.project.path = path.relative(rootDir, dir) || '.';
+        loaded.push({ dir, parts });
       }
     } catch (error) {
       // Skip projects that fail to scan
@@ -696,5 +855,11 @@ export async function scanElixirProjects(
     }
   }
 
-  return results;
+  const byAbsDir = new Map(loaded.map(({ dir, parts }) => [path.resolve(dir), parts]));
+  for (const { dir, parts } of loaded) {
+    const refs = linkReferences(dir, rootDir, parts.project.path, parts, byAbsDir);
+    if (refs.length > 0) parts.project.projectReferences = refs;
+  }
+
+  return loaded.map(({ parts }) => parts.project);
 }
